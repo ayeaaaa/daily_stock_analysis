@@ -503,10 +503,13 @@ class Config:
     bocha_api_keys: List[str] = field(default_factory=list)  # Bocha API Keys
     minimax_api_keys: List[str] = field(default_factory=list)  # MiniMax API Keys
     tavily_api_keys: List[str] = field(default_factory=list)  # Tavily API Keys
+    qveris_api_keys: List[str] = field(default_factory=list)  # QVeris API Keys
     brave_api_keys: List[str] = field(default_factory=list)  # Brave Search API Keys
     serpapi_keys: List[str] = field(default_factory=list)  # SerpAPI Keys
     searxng_base_urls: List[str] = field(default_factory=list)  # SearXNG instance URLs (self-hosted, no quota)
     searxng_public_instances_enabled: bool = True  # Auto-discover public SearXNG instances when base URLs are absent
+    qveris_base_url: str = "https://qveris.ai"  # QVeris REST API base URL
+    qveris_news_tool_id: Optional[str] = None  # Preferred QVeris news tool id
 
     # === Social Sentiment (US stocks only, api.adanos.org) ===
     social_sentiment_api_key: Optional[str] = None
@@ -1033,6 +1036,9 @@ class Config:
         
         tavily_keys_str = os.getenv('TAVILY_API_KEYS', '')
         tavily_api_keys = [k.strip() for k in tavily_keys_str.split(',') if k.strip()]
+
+        qveris_keys_str = os.getenv('QVERIS_API_KEYS', '')
+        qveris_api_keys = [k.strip() for k in qveris_keys_str.split(',') if k.strip()]
         
         serpapi_keys_str = os.getenv('SERPAPI_API_KEYS', '')
         serpapi_keys = [k.strip() for k in serpapi_keys_str.split(',') if k.strip()]
@@ -1161,10 +1167,13 @@ class Config:
             bocha_api_keys=bocha_api_keys,
             minimax_api_keys=minimax_api_keys,
             tavily_api_keys=tavily_api_keys,
+            qveris_api_keys=qveris_api_keys,
             brave_api_keys=brave_api_keys,
             serpapi_keys=serpapi_keys,
             searxng_base_urls=searxng_base_urls,
             searxng_public_instances_enabled=searxng_public_instances_enabled,
+            qveris_base_url=(os.getenv('QVERIS_BASE_URL') or 'https://qveris.ai').rstrip('/'),
+            qveris_news_tool_id=os.getenv('QVERIS_NEWS_TOOL_ID') or None,
             social_sentiment_api_key=os.getenv('SOCIAL_SENTIMENT_API_KEY') or None,
             social_sentiment_api_url=os.getenv('SOCIAL_SENTIMENT_API_URL', 'https://api.adanos.org').rstrip('/'),
             news_max_age_days=parse_env_int(os.getenv('NEWS_MAX_AGE_DAYS'), 3, field_name='NEWS_MAX_AGE_DAYS', minimum=1),
@@ -1915,6 +1924,7 @@ class Config:
             or self.bocha_api_keys
             or self.minimax_api_keys
             or self.tavily_api_keys
+            or self.qveris_api_keys
             or self.brave_api_keys
             or self.serpapi_keys
             or self.has_searxng_enabled()

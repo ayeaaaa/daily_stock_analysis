@@ -5,7 +5,7 @@ import json
 import logging
 from pathlib import Path
 from threading import RLock
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Tuple
 
 from src.data.stock_mapping import is_meaningful_stock_name
 
@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 _STOCK_INDEX_FILENAME = "stocks.index.json"
 _STOCK_INDEX_CACHE: Dict[str, str] | None = None
+_STOCK_ALIAS_CACHE: Dict[str, Tuple[str, ...]] | None = None
 _STOCK_INDEX_CACHE_LOCK = RLock()
 
 
@@ -85,6 +86,38 @@ def _load_stock_index_file(index_path: Path) -> Dict[str, str]:
     return stock_name_map
 
 
+def _load_stock_alias_index_file(index_path: Path) -> Dict[str, Tuple[str, ...]]:
+    with index_path.open("r", encoding="utf-8") as fh:
+        raw_items = json.load(fh)
+
+    if not isinstance(raw_items, list):
+        raise ValueError(
+            f"Unexpected {_STOCK_INDEX_FILENAME} payload type: {type(raw_items).__name__}"
+        )
+
+    stock_alias_map: Dict[str, Tuple[str, ...]] = {}
+    for item in raw_items:
+        if not isinstance(item, list) or len(item) < 6:
+            continue
+
+        canonical_code, display_code, aliases = item[0], item[1], item[5]
+        if not isinstance(aliases, list):
+            continue
+
+        normalized_aliases = tuple(
+            alias.strip()
+            for alias in aliases
+            if isinstance(alias, str) and alias.strip()
+        )
+        if not normalized_aliases:
+            continue
+
+        for key in _build_lookup_keys(str(canonical_code or ""), str(display_code or "")):
+            stock_alias_map[key] = normalized_aliases
+
+    return stock_alias_map
+
+
 def get_stock_name_index_map() -> Dict[str, str]:
     """Lazily load and cache the generated stock-name index."""
     global _STOCK_INDEX_CACHE
@@ -130,7 +163,37 @@ def get_index_stock_name(stock_code: str) -> str | None:
     return None
 
 
+def get_index_stock_aliases(stock_code: str) -> Tuple[str, ...]:
+    """Resolve stock aliases from the generated frontend stock index."""
+    global _STOCK_ALIAS_CACHE
+
+    code = str(stock_code or "").strip()
+    if not code:
+        return ()
+
+    if _STOCK_ALIAS_CACHE is None:
+        with _STOCK_INDEX_CACHE_LOCK:
+            if _STOCK_ALIAS_CACHE is None:
+                for candidate_path in get_stock_index_candidate_paths():
+                    if not candidate_path.is_file():
+                        continue
+                    try:
+                        _STOCK_ALIAS_CACHE = _load_stock_alias_index_file(candidate_path)
+                        break
+                    except (OSError, TypeError, ValueError) as exc:
+                        logger.debug("[股票别名] 读取股票索引失败 %s: %s", candidate_path, exc)
+                if _STOCK_ALIAS_CACHE is None:
+                    _STOCK_ALIAS_CACHE = {}
+
+    for key in _build_lookup_keys(code, code):
+        aliases = _STOCK_ALIAS_CACHE.get(key) if _STOCK_ALIAS_CACHE is not None else None
+        if aliases:
+            return aliases
+    return ()
+
+
 def _clear_stock_index_cache_for_tests() -> None:
-    global _STOCK_INDEX_CACHE
+    global _STOCK_INDEX_CACHE, _STOCK_ALIAS_CACHE
     with _STOCK_INDEX_CACHE_LOCK:
         _STOCK_INDEX_CACHE = None
+        _STOCK_ALIAS_CACHE = None

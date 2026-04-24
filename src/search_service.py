@@ -12,6 +12,7 @@ A股自选股智能分析系统 - 搜索服务模块
 """
 
 import logging
+import json
 import re
 import threading
 import time
@@ -33,6 +34,8 @@ from tenacity import (
 )
 
 from data_provider.us_index_mapping import is_us_index_code
+from src.data.stock_index_loader import get_index_stock_aliases
+from src.services.stock_code_utils import normalize_code
 from src.config import (
     NEWS_STRATEGY_WINDOWS,
     normalize_news_strategy_profile,
@@ -414,6 +417,313 @@ class TavilySearchProvider(BaseSearchProvider):
         """从 URL 提取域名作为来源"""
         try:
             from urllib.parse import urlparse
+            parsed = urlparse(url)
+            domain = parsed.netloc.replace('www.', '')
+            return domain or '未知来源'
+        except Exception:
+            return '未知来源'
+
+
+class QVerisNewsProvider(BaseSearchProvider):
+    """QVeris 新闻搜索 provider，优先适配返回发布时间的新闻工具。"""
+
+    _DISCOVERY_QUERY = "A股 股票 财经新闻 搜索 返回发布时间 正文摘要"
+
+    def __init__(
+        self,
+        api_keys: List[str],
+        *,
+        base_url: str = "https://qveris.ai",
+        preferred_news_tool_id: Optional[str] = None,
+    ):
+        super().__init__(api_keys, "QVeris")
+        self._base_url = (base_url or "https://qveris.ai").rstrip("/")
+        self._preferred_news_tool_id = (preferred_news_tool_id or "").strip() or None
+
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+        stock_name: Optional[str] = None,
+        stock_code: Optional[str] = None,
+    ) -> SearchResponse:
+        session_id = self._build_session_id(stock_code=stock_code, stock_name=stock_name, query=query)
+        search_payload = {
+            "query": self._DISCOVERY_QUERY,
+            "limit": 10,
+            "session_id": session_id,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        search_resp = _post_with_retry(
+            f"{self._base_url}/api/v1/search",
+            headers=headers,
+            json=search_payload,
+            timeout=20,
+        )
+        search_resp.raise_for_status()
+        search_data = search_resp.json()
+        search_id = search_data.get("search_id")
+        if not search_id:
+            raise ValueError("QVeris 搜索响应缺少 search_id")
+
+        tool = self._select_tool(search_data.get("results") or [])
+        if not tool:
+            raise ValueError("QVeris 未找到可用新闻工具")
+
+        execute_payload = {
+            "search_id": search_id,
+            "session_id": session_id,
+            "parameters": self._build_parameters(
+                tool_id=tool.get("tool_id", ""),
+                query=query,
+                stock_name=stock_name,
+                stock_code=stock_code,
+                max_results=max_results,
+                days=days,
+            ),
+            "max_response_size": 20000,
+        }
+        execute_resp = _post_with_retry(
+            f"{self._base_url}/api/v1/tools/execute?tool_id={tool['tool_id']}",
+            headers=headers,
+            json=execute_payload,
+            timeout=30,
+        )
+        execute_resp.raise_for_status()
+        execute_data = execute_resp.json()
+        if not execute_data.get("success", False):
+            raise ValueError(execute_data.get("error_message") or "QVeris 工具执行失败")
+
+        items = self._extract_result_items(execute_data)
+        results = [self._to_search_result(item) for item in items]
+        results = [item for item in results if item.title and item.url][:max_results]
+
+        logger.info(
+            "[QVeris] tool=%s, query='%s', 返回 %s 条结果",
+            tool.get("tool_id"),
+            query,
+            len(results),
+        )
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider=f"{self.name}:{tool.get('tool_id', '')}",
+            success=True,
+        )
+
+    def search(
+        self,
+        query: str,
+        max_results: int = 5,
+        days: int = 7,
+        stock_name: Optional[str] = None,
+        stock_code: Optional[str] = None,
+    ) -> SearchResponse:
+        return self._execute_search(
+            query,
+            max_results=max_results,
+            days=days,
+            stock_name=stock_name,
+            stock_code=stock_code,
+        )
+
+    def _select_tool(self, results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not results:
+            return None
+        if self._preferred_news_tool_id:
+            for item in results:
+                if item.get("tool_id") == self._preferred_news_tool_id:
+                    return item
+
+        preferred_prefixes = (
+            "caidazi.news.query",
+            "caidazi.news",
+        )
+        for item in results:
+            tool_id = str(item.get("tool_id") or "")
+            if tool_id.startswith(preferred_prefixes):
+                return item
+
+        for item in results:
+            provider_name = str(item.get("provider_name") or "").lower()
+            tool_id = str(item.get("tool_id") or "").lower()
+            name = str(item.get("name") or "").lower()
+            if "caidazi" in provider_name or "caidazi" in tool_id or "news" in name:
+                return item
+
+        return results[0]
+
+    @staticmethod
+    def _build_session_id(stock_code: Optional[str], stock_name: Optional[str], query: str) -> str:
+        raw = f"{stock_code or ''}:{stock_name or ''}:{query}".strip()
+        digest = re.sub(r"[^a-zA-Z0-9]+", "-", raw)[:48].strip("-") or "news"
+        return f"daily-stock-{digest}"
+
+    @staticmethod
+    def _build_parameters(
+        *,
+        tool_id: str,
+        query: str,
+        stock_name: Optional[str],
+        stock_code: Optional[str],
+        max_results: int,
+        days: int,
+    ) -> Dict[str, Any]:
+        if tool_id.startswith("caidazi.news.query"):
+            focused_query = QVerisNewsProvider._build_caidazi_input_query(
+                query=query,
+                stock_name=stock_name,
+                stock_code=stock_code,
+            )
+            return {
+                "input": focused_query,
+                "size": max(1, min(max_results, 10)),
+            }
+
+        return {
+            "query": query,
+            "limit": max(1, min(max_results, 10)),
+            "days": max(1, days),
+        }
+
+    @staticmethod
+    def _build_caidazi_input_query(
+        *,
+        query: str,
+        stock_name: Optional[str],
+        stock_code: Optional[str],
+    ) -> str:
+        base_name = (stock_name or "").strip()
+        base_code = (stock_code or "").split(".", 1)[0].strip()
+        if base_name:
+            return base_name
+        if base_code:
+            return base_code
+        return re.sub(r"\s+", " ", (query or "").strip())
+
+    @staticmethod
+    def _extract_result_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        result = payload.get("result") or {}
+        truncated_content = result.get("truncated_content")
+        if isinstance(truncated_content, str) and truncated_content.strip():
+            try:
+                truncated_payload = json.loads(truncated_content)
+            except json.JSONDecodeError:
+                truncated_payload = None
+            if isinstance(truncated_payload, dict):
+                nested_data = truncated_payload.get("data")
+                if isinstance(nested_data, dict):
+                    for key in ("hits", "results", "items", "articles", "news", "list"):
+                        value = nested_data.get(key)
+                        if isinstance(value, list):
+                            return [item for item in value if isinstance(item, dict)]
+
+        data = result.get("data")
+        if isinstance(data, dict):
+            nested = data.get("data")
+            if isinstance(nested, dict):
+                for key in ("hits", "results", "items", "articles", "news", "list"):
+                    value = nested.get(key)
+                    if isinstance(value, list):
+                        return [item for item in value if isinstance(item, dict)]
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if not isinstance(data, dict):
+            return []
+
+        for key in ("results", "items", "articles", "news", "list"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+
+        return [data] if data else []
+
+    @classmethod
+    def _to_search_result(cls, item: Dict[str, Any]) -> SearchResult:
+        source_payload = item.get("source") if isinstance(item.get("source"), dict) else {}
+        url = (
+            item.get("url")
+            or item.get("link")
+            or item.get("sourceUrl")
+            or source_payload.get("url")
+            or source_payload.get("s3Url")
+            or ""
+        )
+        snippet = (
+            item.get("bodySegHighlight")
+            or item.get("body")
+            or item.get("content")
+            or item.get("description")
+            or item.get("summary")
+            or item.get("_summary")
+            or source_payload.get("summary")
+            or ""
+        )
+        if isinstance(snippet, list):
+            snippet = " ".join(str(part).strip() for part in snippet if str(part).strip())
+        source = (
+            item.get("sourceName")
+            or item.get("siteName")
+            or source_payload.get("sourceName")
+            or source_payload.get("newsSourceName")
+            or source_payload.get("siteName")
+            or item.get("provider")
+            or cls._extract_domain(url)
+        )
+        published_date = cls._normalize_published_date(
+            item.get("publishTime")
+            or item.get("published_date")
+            or item.get("publishedDate")
+            or item.get("_time_published")
+            or item.get("pub_time")
+            or item.get("datetime")
+            or item.get("rec_time")
+            or item.get("ann_date")
+            or source_payload.get("publishTime")
+            or source_payload.get("effectiveTime")
+            or source_payload.get("updateTime")
+        )
+        return SearchResult(
+            title=str(
+                item.get("title")
+                or source_payload.get("title")
+                or item.get("headline")
+                or ""
+            ).strip(),
+            snippet=str(snippet).strip()[:500],
+            url=str(url).strip(),
+            source=str(source).strip() or "未知来源",
+            published_date=published_date,
+        )
+
+    @staticmethod
+    def _normalize_published_date(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if re.fullmatch(r"\d{8}T\d{6}", text):
+            try:
+                return datetime.strptime(text, "%Y%m%dT%H%M%S").isoformat()
+            except ValueError:
+                return text
+        if re.fullmatch(r"\d{8}", text):
+            try:
+                return datetime.strptime(text, "%Y%m%d").date().isoformat()
+            except ValueError:
+                return text
+        return text
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        try:
             parsed = urlparse(url)
             domain = parsed.netloc.replace('www.', '')
             return domain or '未知来源'
@@ -2121,12 +2431,15 @@ class SearchService:
         self,
         bocha_keys: Optional[List[str]] = None,
         tavily_keys: Optional[List[str]] = None,
+        qveris_keys: Optional[List[str]] = None,
         anspire_keys: Optional[List[str]] = None,
         brave_keys: Optional[List[str]] = None,
         serpapi_keys: Optional[List[str]] = None,
         minimax_keys: Optional[List[str]] = None,
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = True,
+        qveris_base_url: str = "https://qveris.ai",
+        qveris_news_tool_id: Optional[str] = None,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2136,12 +2449,15 @@ class SearchService:
         Args:
             bocha_keys: 博查搜索 API Key 列表
             tavily_keys: Tavily API Key 列表
+            qveris_keys: QVeris API Key 列表
             anspire_keys: Anspire Search API Key 列表
             brave_keys: Brave Search API Key 列表
             serpapi_keys: SerpAPI Key 列表
             minimax_keys: MiniMax API Key 列表
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
+            qveris_base_url: QVeris REST API 基础地址
+            qveris_news_tool_id: 优先使用的 QVeris 新闻工具 ID
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
@@ -2169,27 +2485,38 @@ class SearchService:
             self._providers.append(BochaSearchProvider(bocha_keys))
             logger.info(f"已配置 Bocha 搜索，共 {len(bocha_keys)} 个 API Key")
 
-        # 2. Tavily（免费额度更多，每月 1000 次）
+        # 2. QVeris（优先适配带发布时间的财经新闻工具）
+        if qveris_keys:
+            self._providers.append(
+                QVerisNewsProvider(
+                    qveris_keys,
+                    base_url=qveris_base_url,
+                    preferred_news_tool_id=qveris_news_tool_id,
+                )
+            )
+            logger.info("已配置 QVeris 新闻搜索，共 %s 个 API Key", len(qveris_keys))
+
+        # 3. Tavily（免费额度更多，每月 1000 次）
         if tavily_keys:
             self._providers.append(TavilySearchProvider(tavily_keys))
             logger.info(f"已配置 Tavily 搜索，共 {len(tavily_keys)} 个 API Key")
 
-        # 3. Brave Search（隐私优先，全球覆盖）
+        # 4. Brave Search（隐私优先，全球覆盖）
         if brave_keys:
             self._providers.append(BraveSearchProvider(brave_keys))
             logger.info(f"已配置 Brave 搜索，共 {len(brave_keys)} 个 API Key")
 
-        # 4. SerpAPI 作为备选（每月 100 次）
+        # 5. SerpAPI 作为备选（每月 100 次）
         if serpapi_keys:
             self._providers.append(SerpAPISearchProvider(serpapi_keys))
             logger.info(f"已配置 SerpAPI 搜索，共 {len(serpapi_keys)} 个 API Key")
 
-        # 5. MiniMax（Coding Plan Web Search，结构化结果）
+        # 6. MiniMax（Coding Plan Web Search，结构化结果）
         if minimax_keys:
             self._providers.append(MiniMaxSearchProvider(minimax_keys))
             logger.info(f"已配置 MiniMax 搜索，共 {len(minimax_keys)} 个 API Key")
 
-        # 6. SearXNG（自建实例优先；未配置时可自动发现公共实例）
+        # 7. SearXNG（自建实例优先；未配置时可自动发现公共实例）
         searxng_provider = SearXNGSearchProvider(
             searxng_base_urls,
             use_public_instances=bool(searxng_public_instances_enabled and not searxng_base_urls),
@@ -2201,7 +2528,7 @@ class SearchService:
             else:
                 logger.info("已启用 SearXNG 公共实例自动发现模式")
 
-        # 7. Anspire Search（实时智能搜索优化）
+        # 8. Anspire Search（实时智能搜索优化）
         if anspire_keys:
             self._providers.insert(0, AnspireSearchProvider(anspire_keys))
             logger.info(f"已配置 Anspire Search 搜索，共 {len(anspire_keys)} 个 API Key")
@@ -2655,6 +2982,91 @@ class SearchService:
             search_time=response.search_time,
         )
 
+    @staticmethod
+    def _build_stock_relevance_tokens(stock_code: str, stock_name: str) -> List[str]:
+        tokens: List[str] = []
+
+        def _add(token: Optional[str]) -> None:
+            value = (token or "").strip()
+            if value and value not in tokens:
+                tokens.append(value)
+
+        name = (stock_name or "").strip()
+        code = (stock_code or "").strip().upper()
+        normalized_code = normalize_code(stock_code or "") or ""
+
+        _add(name)
+        _add(code)
+        _add(normalized_code)
+        for alias in get_index_stock_aliases(stock_code):
+            _add(alias)
+
+        if normalized_code.isdigit():
+            _add(normalized_code.lstrip("0"))
+            if len(normalized_code) <= 5:
+                hk_code = normalized_code.zfill(5)
+                _add(hk_code)
+                _add(f"HK{hk_code}")
+                _add(f"{hk_code}.HK")
+
+        if code.startswith("HK") and len(code) > 2:
+            suffix = code[2:]
+            _add(suffix)
+            if suffix.isdigit():
+                padded = suffix.zfill(5)
+                _add(padded)
+                _add(f"{padded}.HK")
+
+        return [token for token in tokens if token]
+
+    @classmethod
+    def _filter_stock_relevance_response(
+        cls,
+        response: SearchResponse,
+        *,
+        stock_code: str,
+        stock_name: str,
+        max_results: int,
+        log_scope: str,
+    ) -> SearchResponse:
+        if not response.success or not response.results:
+            return response
+
+        relevance_tokens = cls._build_stock_relevance_tokens(stock_code, stock_name)
+        if not relevance_tokens:
+            return response
+
+        filtered: List[SearchResult] = []
+        dropped_irrelevant = 0
+        for item in response.results:
+            haystack = " ".join(filter(None, [item.title, item.snippet, item.url])).lower()
+            if not any(token.lower() in haystack for token in relevance_tokens):
+                dropped_irrelevant += 1
+                continue
+            filtered.append(item)
+            if len(filtered) >= max_results:
+                break
+
+        if dropped_irrelevant:
+            logger.info(
+                "[相关性过滤] %s: provider=%s, total=%s, kept=%s, drop_irrelevant=%s, tokens=%s",
+                log_scope,
+                response.provider,
+                len(response.results),
+                len(filtered),
+                dropped_irrelevant,
+                ",".join(relevance_tokens),
+            )
+
+        return SearchResponse(
+            query=response.query,
+            results=filtered,
+            provider=response.provider,
+            success=response.success,
+            error_message=response.error_message,
+            search_time=response.search_time,
+        )
+
     def _normalize_and_limit_response(
         self,
         response: SearchResponse,
@@ -2716,7 +3128,7 @@ class SearchService:
         self,
         stock_code: str,
         stock_name: str,
-        max_results: int = 5,
+        max_results: int = 10,
         focus_keywords: Optional[List[str]] = None
     ) -> SearchResponse:
         """
@@ -2804,6 +3216,13 @@ class SearchService:
                 search_kwargs: Dict[str, Any] = {}
                 if isinstance(provider, TavilySearchProvider):
                     search_kwargs["topic"] = "news"
+                elif isinstance(provider, QVerisNewsProvider):
+                    search_kwargs.update(
+                        {
+                            "stock_name": stock_name,
+                            "stock_code": stock_code,
+                        }
+                    )
                 elif isinstance(provider, BraveSearchProvider):
                     search_kwargs.update(
                         self._brave_search_locale(
@@ -2816,6 +3235,13 @@ class SearchService:
                 filtered_response = self._filter_news_response(
                     response,
                     search_days=search_days,
+                    max_results=provider_max_results,
+                    log_scope=f"{stock_code}:{provider.name}:stock_news",
+                )
+                filtered_response = self._filter_stock_relevance_response(
+                    filtered_response,
+                    stock_code=stock_code,
+                    stock_name=stock_name,
                     max_results=provider_max_results,
                     log_scope=f"{stock_code}:{provider.name}:stock_news",
                 )
@@ -3438,12 +3864,15 @@ def get_search_service() -> SearchService:
                 _search_service = SearchService(
                     bocha_keys=config.bocha_api_keys,
                     tavily_keys=config.tavily_api_keys,
+                    qveris_keys=getattr(config, "qveris_api_keys", []),
                     anspire_keys=config.anspire_api_keys,
                     brave_keys=config.brave_api_keys,
                     serpapi_keys=config.serpapi_keys,
                     minimax_keys=config.minimax_api_keys,
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                    qveris_base_url=getattr(config, "qveris_base_url", "https://qveris.ai"),
+                    qveris_news_tool_id=getattr(config, "qveris_news_tool_id", None),
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )

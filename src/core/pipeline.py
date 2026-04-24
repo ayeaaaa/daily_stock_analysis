@@ -107,12 +107,15 @@ class StockAnalysisPipeline:
             self.search_service = SearchService(
                 bocha_keys=self.config.bocha_api_keys,
                 tavily_keys=self.config.tavily_api_keys,
+                qveris_keys=getattr(self.config, "qveris_api_keys", []),
                 anspire_keys=self.config.anspire_api_keys,
                 brave_keys=self.config.brave_api_keys,
                 serpapi_keys=self.config.serpapi_keys,
                 minimax_keys=self.config.minimax_api_keys,
                 searxng_base_urls=self.config.searxng_base_urls,
                 searxng_public_instances_enabled=self.config.searxng_public_instances_enabled,
+                qveris_base_url=getattr(self.config, "qveris_base_url", "https://qveris.ai"),
+                qveris_news_tool_id=getattr(self.config, "qveris_news_tool_id", None),
                 news_max_age_days=self.config.news_max_age_days,
                 news_strategy_profile=getattr(self.config, "news_strategy_profile", "short"),
             )
@@ -853,7 +856,7 @@ class StockAnalysisPipeline:
                     news_response = self.search_service.search_stock_news(
                         stock_code=code,
                         stock_name=resolved_stock_name,
-                        max_results=5
+                        max_results=10
                     )
                     if news_response.success and news_response.results:
                         query_context = self._build_query_context(query_id=query_id)

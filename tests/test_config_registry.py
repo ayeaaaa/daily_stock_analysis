@@ -141,5 +141,45 @@ class TestDiscordInteractionPublicKeyField(unittest.TestCase):
         self.assertIn("DISCORD_INTERACTIONS_PUBLIC_KEY", field_keys)
 
 
+class TestQVerisFieldsRegistered(unittest.TestCase):
+    """QVeris config keys must be registered for the dynamic settings UI."""
+
+    _QVERIS_KEYS = (
+        "QVERIS_API_KEYS",
+        "QVERIS_BASE_URL",
+        "QVERIS_NEWS_TOOL_ID",
+    )
+
+    def test_field_definitions_exist(self):
+        for key in self._QVERIS_KEYS:
+            field = get_field_definition(key)
+            self.assertEqual(field["category"], "data_source", f"{key} category")
+            self.assertNotEqual(
+                field["display_order"], 9000,
+                f"{key} should be explicitly registered, not inferred",
+            )
+
+    def test_api_keys_is_sensitive(self):
+        field = get_field_definition("QVERIS_API_KEYS")
+        self.assertTrue(field["is_sensitive"])
+        self.assertEqual(field["ui_control"], "password")
+
+    def test_base_url_uses_url_validation(self):
+        field = get_field_definition("QVERIS_BASE_URL")
+        self.assertEqual(field["validation"]["item_type"], "url")
+        self.assertIn("https", field["validation"]["allowed_schemes"])
+
+    def test_schema_response_includes_qveris_fields(self):
+        schema = build_schema_response()
+        data_source_cat = next(
+            (c for c in schema["categories"] if c["category"] == "data_source"),
+            None,
+        )
+        self.assertIsNotNone(data_source_cat, "data_source category missing")
+        field_keys = {f["key"] for f in data_source_cat["fields"]}
+        for key in self._QVERIS_KEYS:
+            self.assertIn(key, field_keys, f"{key} missing from schema response")
+
+
 if __name__ == "__main__":
     unittest.main()

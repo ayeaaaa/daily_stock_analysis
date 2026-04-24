@@ -28,7 +28,7 @@ def _handle_search_stock_news(stock_code: str, stock_name: str) -> dict:
     if not service.is_available:
         return {"error": "No search engine available (no API keys configured)"}
 
-    response = service.search_stock_news(stock_code, stock_name, max_results=5)
+    response = service.search_stock_news(stock_code, stock_name, max_results=10)
 
     if not response.success:
         return {

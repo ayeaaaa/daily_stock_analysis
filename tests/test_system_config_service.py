@@ -170,6 +170,11 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertFalse(validation["valid"])
         self.assertTrue(any(issue["code"] == "invalid_url" for issue in validation["issues"]))
 
+    def test_validate_reports_invalid_qveris_base_url(self) -> None:
+        validation = self.service.validate(items=[{"key": "QVERIS_BASE_URL", "value": "qveris-without-scheme"}])
+        self.assertFalse(validation["valid"])
+        self.assertTrue(any(issue["code"] == "invalid_url" for issue in validation["issues"]))
+
     def test_validate_reports_invalid_public_searxng_toggle(self) -> None:
         validation = self.service.validate(
             items=[{"key": "SEARXNG_PUBLIC_INSTANCES_ENABLED", "value": "maybe"}]
